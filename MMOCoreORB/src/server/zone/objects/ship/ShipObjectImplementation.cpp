@@ -31,6 +31,9 @@
 #include "server/zone/packets/tangible/UpdatePVPStatusMessage.h"
 #include "server/zone/packets/scene/SceneObjectDestroyMessage.h"
 #include "server/zone/objects/intangible/tasks/StoreShipTask.h"
+#include "server/zone/objects/ship/ai/ShipAiAgent.h"
+#include "server/zone/objects/tangible/item/CreditChipObject.h"
+#include "server/zone/managers/loot/LootManager.h"
 
 // #define DEBUG_COV
 
@@ -857,7 +860,7 @@ void ShipObjectImplementation::doRecovery(int mselapsed) {
 	updateComponentFlags(false, deltaVector);
 
 	if (deltaVector != nullptr) {
-		deltaVector->sendMessages(asShipObject(), pilot);
+		deltaVector->sendMessages(asShipObject());
 	}
 
 	auto targetVector = getTargetVector();
@@ -1119,7 +1122,7 @@ void ShipObjectImplementation::repairShip(float value, bool decay) {
 	}
 
 	if (deltaVector != nullptr) {
-		deltaVector->sendMessages(asShipObject(), pilot);
+		deltaVector->sendMessages(asShipObject());
 	}
 
 #ifdef DEBUG_SHIP_REPAIR
@@ -1165,7 +1168,7 @@ void ShipObjectImplementation::addComponentFlag(uint32 slot, uint32 value, bool 
 	setComponentOptions(slot, componentFlag, nullptr, DeltaMapCommands::SET, deltaVector);
 
 	if (deltaVector != nullptr && notifyClient) {
-		deltaVector->sendMessages(asShipObject(), getPilot());
+		deltaVector->sendMessages(asShipObject());
 	}
 }
 
@@ -1185,7 +1188,7 @@ void ShipObjectImplementation::removeComponentFlag(uint32 slot, uint32 value, bo
 	setComponentOptions(slot, componentFlag, nullptr, DeltaMapCommands::SET, deltaVector);
 
 	if (deltaVector != nullptr && notifyClient) {
-		deltaVector->sendMessages(asShipObject(), getPilot());
+		deltaVector->sendMessages(asShipObject());
 	}
 }
 
@@ -1219,7 +1222,7 @@ void ShipObjectImplementation::resetComponentFlag(uint32 slot, bool notifyClient
 	setComponentOptions(slot, componentFlag, nullptr, DeltaMapCommands::SET, deltaVector);
 
 	if (deltaVector != nullptr && notifyClient) {
-		deltaVector->sendMessages(asShipObject(), getPilot());
+		deltaVector->sendMessages(asShipObject());
 	}
 }
 
@@ -1252,7 +1255,7 @@ void ShipObjectImplementation::setComponentDemolished(uint32 slot, bool notifyCl
 	}
 
 	if (deltaVector != nullptr && notifyClient) {
-		deltaVector->sendMessages(asShipObject(),getPilot());
+		deltaVector->sendMessages(asShipObject());
 	}
 }
 
@@ -1784,6 +1787,133 @@ void ShipObjectImplementation::sendMembersBaseMessage(BaseMessage* message) {
 	delete message;
 }
 
+void ShipObjectImplementation::awardLootItems(ShipAiAgent* destructedShip, int payout) {
+	if (destructedShip == nullptr) {
+		return;
+	}
+
+	auto zoneServer = getZoneServer();
+
+	if (zoneServer == nullptr) {
+		return;
+	}
+
+	auto lootManager = zoneServer->getLootManager();
+
+	if (lootManager == nullptr) {
+		return;
+	}
+
+	auto pilot = getPilot();
+
+	if (pilot == nullptr) {
+		return;
+	}
+
+	Locker pilotClock(pilot, destructedShip);
+
+	auto inventory = pilot->getInventory();
+
+	if (inventory == nullptr) {
+		return;
+	}
+
+	int inventoryVolume = inventory->getContainerVolumeLimit();
+
+	// Initial Inventory check can return if full
+	if ((inventory->getCountableObjectsRecursive() + 1) > inventoryVolume) {
+		pilot->sendSystemMessage("@space/space_loot:no_more_loot"); // "Your inventory is full so you cannot receive any more loot."
+		return;
+	}
+
+	// Get pilots group for messages
+	Reference<GroupObject*> pilotGroup = nullptr;
+
+	if (pilot->isGrouped()) {
+		pilotGroup = pilot->getGroup();
+	}
+
+	// Main Loot TransactionLog
+	TransactionLog trx(TrxCode::NPCLOOT, destructedShip);
+
+	auto creditChip = zoneServer->createObject(STRING_HASHCODE("object/tangible/item/loot_credit_chip.iff"), 1).castTo<CreditChipObject*>();
+
+	if (creditChip != nullptr) {
+		Locker creditsClock(creditChip, destructedShip);
+
+		// Set the CreditChip value
+		creditChip->setUseCount(payout);
+
+		// Create CreditChip TransactionLog
+		TransactionLog trxChip(TrxCode::CREDITCHIP, pilot, creditChip, true);
+
+		// Transfer to Pilots inventory
+		if (inventory->transferObject(creditChip, -1, false)) {
+			creditChip->sendTo(pilot, true);
+
+			StringIdChatParameter creditsSelfMsg("space/space_loot", "looted_credits_you");
+			creditsSelfMsg.setDI(payout);
+
+			pilot->sendSystemMessage(creditsSelfMsg);
+
+			trxChip.groupWith(trx);
+
+			if (pilotGroup != nullptr) {
+				StringIdChatParameter creditGroupMsg("space/space_loot", "looted_credits");
+				creditGroupMsg.setTT(pilot->getFirstName());
+				creditGroupMsg.setDI(payout);
+
+				pilotGroup->sendSystemMessage(creditGroupMsg, pilot);
+			}
+		} else {
+			creditChip->destroyObjectFromWorld(true);
+			creditChip->destroyObjectFromDatabase(true);
+
+			trxChip.abort() << "Failed to transferObject for CreditChip to shipMember";
+		}
+	}
+
+	// Award Loot items here
+	int lootRolls = destructedShip->getLootRolls();
+	const auto lootTable = destructedShip->getLootTable();
+
+	if (lootTable.isEmpty()) {
+		trx.commit(true);
+		return;
+	}
+
+	for (int i = 0; i < lootRolls; i++) {
+		// Check if there is space in players inventory, if not do not itterate anymore attempts
+		if ((inventory->getCountableObjectsRecursive() + 1) > inventoryVolume) {
+			pilot->sendSystemMessage("@space/space_loot:no_more_loot"); // "Your inventory is full so you cannot receive any more loot."
+			break;
+		}
+
+		uint64 lootObjectID = lootManager->createLoot(trx, inventory, destructedShip);
+
+		if (lootObjectID < 1) {
+			continue;
+		}
+
+		// Send Pilot Message
+		StringIdChatParameter itemSelfMsg("space/space_loot", "looted_item_you"); // "You have looted an item: %TO."
+		itemSelfMsg.setTO(lootObjectID);
+
+		pilot->sendSystemMessage(itemSelfMsg);
+
+		// Send Group Messages
+		if (pilotGroup != nullptr) {
+			StringIdChatParameter itemGroupMsg("space/space_loot", "looted_item"); // "%TT has looted an item: %TO."
+			itemGroupMsg.setTT(pilot->getFirstName());
+			itemGroupMsg.setTO(lootObjectID);
+
+			pilotGroup->sendSystemMessage(itemGroupMsg, pilot);
+		}
+	}
+
+	trx.commit(true);
+}
+
 bool ShipObjectImplementation::isShipLaunched() {
 	return getLocalZone() != nullptr;
 }
@@ -1911,7 +2041,7 @@ void ShipObjectImplementation::updateSpeedRotationValues(bool notifyClient, Ship
 	}
 
 	if (deltaVector != nullptr && notifyClient) {
-		deltaVector->sendMessages(asShipObject(), getPilot());
+		deltaVector->sendMessages(asShipObject());
 	}
 }
 
@@ -1970,7 +2100,7 @@ void ShipObjectImplementation::updateActualEngineValues(bool notifyClient, ShipD
 	}
 
 	if (deltaVector != nullptr && notifyClient) {
-		deltaVector->sendMessages(asShipObject(), getPilot());
+		deltaVector->sendMessages(asShipObject());
 	}
 }
 
@@ -2020,7 +2150,7 @@ void ShipObjectImplementation::updateComponentFlags(bool notifyClient, ShipDelta
 		componentOptions.update(Components::REACTOR, componentFlag, nullptr, DeltaMapCommands::SET, deltaVector);
 
 		if (deltaVector != nullptr && notifyClient) {
-			deltaVector->sendMessages(asShipObject(), getPilot());
+			deltaVector->sendMessages(asShipObject());
 		}
 	}
 }

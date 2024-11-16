@@ -11,6 +11,8 @@ import server.zone.objects.creature.CreatureObject;
 import system.util.Vector;
 import engine.util.u3d.Vector3;
 import server.zone.Zone;
+import server.zone.objects.ship.ai.ShipAiAgent;
+import system.thread.ReadWriteLock;
 
 include server.zone.objects.ship.ShipObject;
 include server.zone.TreeEntry;
@@ -21,9 +23,13 @@ include server.zone.objects.ship.PlayerLaunchPoints;
 include server.zone.objects.ship.DamageSparkLocations;
 include server.zone.objects.cell.CellObject;
 include server.zone.objects.ship.ShipPermissionList;
+include server.zone.objects.tangible.TangibleObject;
+
 
 class PobShipObject extends ShipObject {
 	public static final unsigned int MAX_PLAYER_ITEMS = 100;
+
+	public static final int PLASMA_CONDUIT = -1;
 
 	@dereferenced
 	protected VectorMap<string, CellObject> cellNameMap;
@@ -43,6 +49,15 @@ class PobShipObject extends ShipObject {
 	@dereferenced
 	protected ShipPermissionList shipPermissionList;
 
+	protected SceneObject shipLootBox;
+
+	@dereferenced
+	@local
+	protected transient VectorMap<unsigned long, int> damageInteriorComponents;
+
+	@dereferenced
+	protected transient ReadWriteLock intComponentsMutex;
+
 	public PobShipObject() {
 		Logger.setLoggingName("PobShipObject");
 	}
@@ -51,9 +66,6 @@ class PobShipObject extends ShipObject {
 
 	@local
 	public native abstract void loadTemplateData(SharedObjectTemplate templateData);
-
-	@local
-	public native abstract void loadTemplateData(SharedShipObjectTemplate shipTemp);
 
 	@preLocked
 	public native void createChildObjects();
@@ -161,6 +173,10 @@ class PobShipObject extends ShipObject {
 	 */
 	public native void destroyAllPlayerItems();
 
+	@preLocked
+	@arg1preLocked
+	public abstract native void awardLootItems(ShipAiAgent destructedShip, int payout);
+
 	@dirty
 	public CellObject getCell(int idx) {
 		return cells.get(idx);
@@ -214,7 +230,6 @@ class PobShipObject extends ShipObject {
 		return shipPermissionList.isOnPermissionList(listName, objectID);
 	}
 
-
 	@read
 	public int getTotalPlasmaAlarms() {
 		return plasmaAlarms.size();
@@ -223,4 +238,10 @@ class PobShipObject extends ShipObject {
 	public unsigned long getPlasmaAlarms(int idx) {
 		return plasmaAlarms.get(idx);
 	}
+
+	public native void addDamagedInteriorComponent(unsigned long interiorComponentID, int type);
+
+	public native void removeDamagedInteriorComponent(unsigned long interiorComponentID);
+
+	public native boolean hasActivePlasmaLeaks();
 }

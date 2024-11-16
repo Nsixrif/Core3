@@ -169,6 +169,7 @@ public:
 	const static int DEADEYEPROTOTYPE = 0x203C;
 	const static int LIGHTOBJECT = 0x203D;
 	const static int SPACESPAWNER = 0x203E;
+	const static int CREDITCHIP = 0x203F;
 	/// End Not in client **************
 
 	const static int TERMINAL = 0x4000;
@@ -382,6 +383,9 @@ public:
 	const static int SHIPCOUNTERMEASURE = 0x4000000E;
 	const static int SHIPWEAPONLAUNCHER = 0x4000000F;
 	const static int SHIPCOUNTERMEASURELAUNCHER = 0x40000010;
+
+	// Not in client ************
+	const static int SHIPINTERIORCOMPONENT = 0x40000011;
 
 public:
 	static const String typeToString(int gameObjectType);

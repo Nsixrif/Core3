@@ -408,13 +408,12 @@ void SpaceManagerImplementation::loadLuaConfig() {
 
 			shipAgent->initializePosition(x, z, y);
 			shipAgent->setDirection(direction);
+			shipAgent->initializeTransform(Vector3(x,y,z), direction);
 
 			// Transfer into the zone
 			spaceZone->transferObject(shipAgent, -1, true);
 
 			shipAgent->createChildObjects();
-
-			shipAgent->setRotationMatrix(direction);
 
 			String faction = shipAgent->getShipFaction();
 
@@ -639,7 +638,7 @@ bool SpaceManagerImplementation::findNearbySpawner(float x, float z, float y, fl
 
 	SortedVector<TreeEntry*> closeObjects;
 
-	spaceZone->getInRangeObjects(targetPos.getX(), targetPos.getZ(), targetPos.getY(), ZoneServer::SPACEOBJECTRANGE, &closeObjects, true, false);
+	spaceZone->getInRangeObjects(targetPos.getX(), targetPos.getZ(), targetPos.getY(), ZoneServer::SPACECLOSEOBJECTRANGE, &closeObjects, true, false);
 
 	// info(true) << " -- findNearbySpawner - X: " << targetPos.getX() << " Z: " << targetPos.getZ() << " Y: " << targetPos.getY() << " Distance: " << distance << " Nearby Object Size: " << closeObjects.size();
 
