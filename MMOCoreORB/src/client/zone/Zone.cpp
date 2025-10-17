@@ -24,6 +24,13 @@ Zone::Zone(uint64 characterObjectID, uint32 account, const String& sessionID, co
 	started = false;
 	sceneReady = false;
 
+	characterCreated = false;
+	characterCreationFailed = false;
+	createdCharacterOID = 0;
+
+	lastError = "";
+	lastErrorCode = 0;
+
 	setLogLevel(static_cast<Logger::LogLevel>(ClientCore::getLogLevel()));
 
 	info(true) << "Zone created for character " << characterObjectID << " with sessionID: " << sessionID;
@@ -92,5 +99,20 @@ JSONSerializationType Zone::collectStats() {
 	stats["packetCount"] = client != nullptr ? client->getPacketCount() : 0;
 	stats["sceneReady"] = sceneReady;
 	stats["characterId"] = characterID;
+
+	// Add unknown opcodes if any
+	if (client != nullptr) {
+		auto& unknownOps = client->getZonePacketHandler()->getUnknownOpcodes();
+		if (unknownOps.size() > 0) {
+			JSONSerializationType unknownStats;
+			for (int i = 0; i < unknownOps.size(); i++) {
+				StringBuffer key;
+				key << "0x" << hex << uppercase << unknownOps.elementAt(i).getKey();
+				unknownStats[key.toString().toCharArray()] = unknownOps.elementAt(i).getValue();
+			}
+			stats["unknownOpcodes"] = unknownStats;
+		}
+	}
+
 	return stats;
 }

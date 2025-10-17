@@ -8,20 +8,45 @@
  * @created     : Fri Nov 29 10:04:14 UTC 2019
  */
 
+#ifndef _SWGREALMSAPI_H
+#define _SWGREALMSAPI_H
+
 #ifdef WITH_SWGREALMS_API
-#pragma once
 
 #include "engine/engine.h"
 #include "system/thread/atomic/AtomicInteger.h"
-#include "server/login/account/Account.h"
-#include "server/login/LoginClient.h"
+#include "server/login/objects/Galaxy.h"
+
+#define _TURN_OFF_PLATFORM_STRING
+#include <cpprest/json.h>
+
+// Forward declarations
+class GalaxyBanEntry;
+
+namespace web {
+	namespace http {
+		namespace client {
+			class http_client;
+		}
+	}
+}
 
 namespace server {
 	namespace zone {
 		class ZoneClientSession;
 	}
 	namespace login {
-		class SessionApprovalResult {
+		namespace account {
+			class Account;
+		}
+
+		// Forward declarations
+		class SWGRealmsAPI;
+
+		// Base class for all SWGRealms API results
+		class SWGRealmsAPIResult : public Object {
+			friend class SWGRealmsAPI;
+
 		public:
 			enum ApprovalAction {
 				UNKNOWN = -2,
@@ -33,23 +58,47 @@ namespace server {
 				DEBUG = 4
 			};
 
-		private:
-			String resultTrxId;
+		protected:
+			web::json::value jsonData;
 			String resultClientTrxId;
 			ApprovalAction resultAction;
 			String resultTitle;
 			String resultMessage;
 			String resultDetails;
-			String resultEncryptedIP;
-			String resultSessionID;
-			uint32 resultAccountID;
-			uint32 resultStationID;
-			String resultRawJSON;
 			uint64 resultElapsedTimeMS;
 			HashTable<String, String> resultDebug;
 
+			// Blocking call synchronization
+			Mutex blockingMutex;
+			Condition blockingCondition;
+			bool blockingReceived;
+
+#ifdef WITH_SWGREALMS_CALLSTATS
+			// Call trace for detailed profiling (maintains insertion order)
+			Vector<Pair<String, Time>> callTrace;
+#endif
+
 		public:
-			SessionApprovalResult();
+			Function<void()> callback;
+
+			SWGRealmsAPIResult();
+			virtual ~SWGRealmsAPIResult();
+
+			// Parse from JSON - implemented by subclasses
+			virtual bool parse() = 0;
+
+			// Invoke the callback if set
+			inline void invokeCallback() {
+				if (callback) {
+					callback();
+				}
+			}
+
+#ifdef WITH_SWGREALMS_CALLSTATS
+			// Call tracing for profiling
+			void trace(const String& tag);
+			String dumpTrace() const;
+#endif
 
 			String toString() const;
 			String toStringData() const;
@@ -103,12 +152,17 @@ namespace server {
 				resultAction = ApprovalAction::UNKNOWN;
 			}
 
-			inline void setTrxId(const String& trxId) {
-				resultDebug.put("trx_id", trxId);
+			inline void setJSONObject(const web::json::value& json) {
+				jsonData = json;
 			}
 
-			inline const String& getTrxId() const {
-				return resultDebug.get("trx_id");
+			inline const web::json::value& getJSONObject() const {
+				return jsonData;
+			}
+
+			inline String getRawJSON() const {
+				if (jsonData.is_null()) return "";
+				return String(jsonData.serialize().c_str());
 			}
 
 			inline void setClientTrxId(const String& clientTrxId) {
@@ -181,6 +235,62 @@ namespace server {
 				return resultDetails;
 			}
 
+			inline void setElapsedTimeMS(uint64 elapsedTimeMS) {
+				resultElapsedTimeMS = elapsedTimeMS;
+			}
+
+			inline uint64 getElapsedTimeMS() const {
+				return resultElapsedTimeMS;
+			}
+
+			inline void setDebugValue(const String& key, const String& value) {
+				resultDebug.put(key, value);
+			}
+
+			inline const String& getDebugValue(const String& key) const {
+				auto entry = resultDebug.getEntry(key);
+
+				if (entry) {
+					return entry->getValue();
+				} else {
+					const static String empty;
+					return empty;
+				}
+			}
+
+			inline const HashTable<String, String>& getDebugHashTable() const {
+				return resultDebug;
+			}
+
+			inline void setTrxId(const String& trxId) {
+				resultDebug.put("trx_id", trxId);
+			}
+
+			inline const String& getTrxId() const {
+				return resultDebug.get("trx_id");
+			}
+		};
+
+		// Forward declare for SessionApprovalResult constructor
+		class SessionApprovalResult;
+		using SessionAPICallback = Function<void(SessionApprovalResult)>;
+
+		// Session-specific result (login, session validation, etc.)
+		class SessionApprovalResult : public SWGRealmsAPIResult {
+		private:
+			String resultEncryptedIP;
+			String resultSessionID;
+			uint32 resultAccountID;
+			uint32 resultStationID;
+
+		public:
+			SessionApprovalResult();
+			SessionApprovalResult(const SessionAPICallback& resultCallback);
+
+			// Implement virtual parse() method
+			bool parse() override;
+
+			// Session-specific methods
 			inline void setEncryptedIP(const String& eip) {
 				resultEncryptedIP = eip;
 			}
@@ -212,44 +322,11 @@ namespace server {
 			inline uint32 getStationID() const {
 				return resultStationID;
 			}
-
-			inline void setElapsedTimeMS(uint64 elapsedTimeMS) {
-				resultElapsedTimeMS = elapsedTimeMS;
-			}
-
-			inline uint64 getElapsedTimeMS() const {
-				return resultElapsedTimeMS;
-			}
-
-			inline void setDebugValue(const String& key, const String& value) {
-				resultDebug.put(key, value);
-			}
-
-			inline const String& getDebugValue(const String& key) const {
-				auto entry = resultDebug.getEntry(key);
-
-				if (entry) {
-					return entry->getValue();
-				} else {
-					const static String empty;
-					return empty;
-				}
-			}
-
-			inline const HashTable<String, String>& getDebugHashTable() const {
-				return resultDebug;
-			}
-
-			inline const String& getRawJSON() const {
-				return resultRawJSON;
-			}
-
-			inline void setRawJSON(const String& json) {
-				resultRawJSON = json;
-			}
 		};
 
-		using SessionAPICallback = Function<void(SessionApprovalResult)>;
+		// Result classes defined in SWGRealmsAPI.cpp to avoid circular includes
+		class AccountResult;
+		class SimpleResult;
 
 		class SWGRealmsAPI : public Logger, public Singleton<SWGRealmsAPI>, public Object {
 		protected:
@@ -262,6 +339,26 @@ namespace server {
 			String baseURL = "";
 			bool dryRun = false;
 			bool failOpen = false;
+			int apiTimeoutMs = 30000;
+
+			// Persistent HTTP client for connection reuse (thread-safe)
+			web::http::client::http_client* httpClient = nullptr;
+
+			// Blocking call statistics
+			AtomicInteger outstandingBlockingCalls = 0;
+			AtomicInteger peakConcurrentCalls = 0;
+			AtomicInteger totalBlockingCalls = 0;
+
+			// Latency histogram (milliseconds)
+			AtomicInteger latency_0_10ms = 0;
+			AtomicInteger latency_10_50ms = 0;
+			AtomicInteger latency_50_100ms = 0;
+			AtomicInteger latency_100_500ms = 0;
+			AtomicInteger latency_500plus = 0;
+
+			// Timing breakdown (for averaging)
+			AtomicLong totalRoundTripMs = 0;
+			AtomicLong totalRequestMs = 0;
 
 		public:
 			SWGRealmsAPI();
@@ -283,16 +380,56 @@ namespace server {
 				return debugLevel;
 			}
 
+			inline bool getFailOpen() const {
+				return failOpen;
+			}
+
 			String toString() const;
 			String toStringData() const;
+
+			// Statistics
+			JSONSerializationType getStatsAsJSON() const;
 
 			// Hook for console "swgrealms" command
 			bool consoleCommand(const String& arguments);
 
+		private:
 			// API Helpers
-			void apiCall(const String& src, const String& basePath, const SessionAPICallback& resultCallback,
+			void apiCall(Reference<SWGRealmsAPIResult*> result, const String& src, const String& path,
 					const String& method = "GET", const String& body = "");
 			void apiNotify(const String& src, const String& basePath);
+
+			bool parseAccountFromJSON(const String& jsonStr, Reference<account::Account*> account, String& errorMessage);
+			bool parseAccountBanStatusFromJSON(const String& jsonStr, Reference<account::Account*> account, String& errorMessage);
+			bool parseGalaxyBansFromJSON(const String& jsonStr, VectorMap<uint32, Reference<GalaxyBanEntry*>>& galaxyBans, String& errorMessage);
+			bool parseGalaxyListFromJSON(const String& jsonStr, Vector<Galaxy>& galaxies, String& errorMessage);
+			Optional<Galaxy> parseGalaxyFromJSON(const String& jsonStr);
+
+			// Generic blocking API call helper - eliminates boilerplate
+			bool apiCallBlocking(Reference<SWGRealmsAPIResult*> result, const String& path, const String& method,
+			                     const String& body, String& errorMessage);
+
+		public:
+			// Account Data Retrieval
+			bool getAccountDataBlocking(uint32 accountID, Reference<account::Account*> account, String& errorMessage);
+			uint32 getAccountID(const String& username, String& errorMessage);
+			bool getAccountBanStatusBlocking(uint32 accountID, Reference<account::Account*> account, String& errorMessage);
+
+			// Account Ban Operations
+			bool banAccountBlocking(uint32 accountID, uint32 issuerID, uint64 expiresTimestamp,
+			                        const String& reason, String& errorMessage);
+			bool unbanAccountBlocking(uint32 accountID, const String& reason, String& errorMessage);
+
+			// Galaxy Ban Operations
+			bool getGalaxyBansBlocking(uint32 accountID, VectorMap<uint32, Reference<GalaxyBanEntry*>>& galaxyBans,
+			                           String& errorMessage);
+			bool banFromGalaxyBlocking(uint32 accountID, uint32 galaxyID, uint32 issuerID, uint64 expiresTimestamp,
+			                           const String& reason, String& errorMessage);
+			bool unbanFromGalaxyBlocking(uint32 accountID, uint32 galaxyID, const String& reason, String& errorMessage);
+
+			// Galaxy Metadata Operations
+			Vector<Galaxy> getAuthorizedGalaxies(uint32 accountID);
+			Optional<Galaxy> getGalaxyEntry(uint32 galaxyID);
 
 			// EIP Helper
 			static void updateClientIPAddress(server::zone::ZoneClientSession* client, const SessionApprovalResult& result);
@@ -318,3 +455,5 @@ namespace server {
 using namespace server::login;
 
 #endif // WITH_SWGREALMS_API
+
+#endif // _SWGREALMSAPI_H

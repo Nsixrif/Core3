@@ -17,11 +17,12 @@ SpaceDestroyScreenplay = SpaceQuestLogic:new {
 
 	sideQuest = false,
 	sideQuestType = "",
-	sideQuestStart = 0, -- Kill Number
+	sideQuestPatrolStart = 0,
 	sideQuestDelay = 0, -- Time in seconds to wait to trigger side quest
 
 	parentQuest = "",
-	parentQuestType = "", -- Quest type of parent quest, used for completing tasks
+	parentQuestType = "",
+	parentQuestName = "",
 
 	-- Screenplay Specific Variables
 	killsRequired = 0,
@@ -40,12 +41,16 @@ registerScreenPlay("SpaceDestroyScreenplay", false)
 
 function SpaceDestroyScreenplay:startQuest(pPlayer, pNpc)
 	if (pPlayer == nil) then
-		Logger:log("Quest: " .. self.questName .. " Type: " .. self.QuestType .. " -- Failed to startQuest due to pPlayer being nil.", LT_ERROR)
+		Logger:log("Quest: " .. self.questName .. " Type: " .. self.questType .. " -- Failed to startQuest due to pPlayer being nil.", LT_ERROR)
 		return
 	end
 
 	if (self.DEBUG_SPACE_DESTROY) then
 		print(self.className .. ":startQuest called -- QuestType: " .. self.questType .. " Quest Name: " .. self.questName)
+	end
+
+	if (pNpc == "") then
+		pNpc = nil
 	end
 
 	SpaceHelpers:activateSpaceQuest(pPlayer, pNpc, self.questType, self.questName, false)
@@ -112,12 +117,12 @@ function SpaceDestroyScreenplay:failQuest(pPlayer, notifyClient)
 
 	-- Fail the parent quest
 	if (self.parentQuestType ~= "") then
-		createEvent(200, self.parentQuestType .. "_" .. self.questName, "failQuest", pPlayer, "false")
+		createEvent(200, self.parentQuestType .. "_" .. self.parentQuestName, "failQuest", pPlayer, "false")
 	end
 
 	-- Fail the side quest
-	if (self.sideQuest and SpaceHelpers:isSpaceQuestActive(pPlayer, self.sideQuestType, self.questName)) then
-		createEvent(200, self.sideQuestType .. "_" .. self.questName, "failQuest", pPlayer, "false")
+	if (self.sideQuest and SpaceHelpers:isSpaceQuestActive(pPlayer, self.sideQuestType, self.sideQuestName)) then
+		createEvent(200, self.sideQuestType .. "_" .. self.sideQuestName, "failQuest", pPlayer, "false")
 	end
 end
 
@@ -216,12 +221,12 @@ function SpaceDestroyScreenplay:notifyDestroyedShip(pPlayer, pShipAgent)
 		return 0
 	end
 
-	if (self.DEBUG_SPACE_DESTROY) then
-		print(self.className .. ":notifyDestroyedShip -- Called for Destructed ShipAgent Object: " .. ShipObject(pShipAgent):getShipName() .. " Destructor: " .. SceneObject(pPlayer):getDisplayedName())
-	end
-
 	if (pPlayer == nil or not SceneObject(pPlayer):isPlayerCreature()) then
 		return 1
+	end
+
+	if (self.DEBUG_SPACE_DESTROY) then
+		print(self.className .. ":notifyDestroyedShip -- Called for Destructed ShipAgent Object: " .. ShipObject(pShipAgent):getShipName() .. " Destructor: " .. SceneObject(pPlayer):getDisplayedName())
 	end
 
 	local playerID = SceneObject(pPlayer):getObjectID()
