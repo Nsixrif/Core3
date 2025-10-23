@@ -40,31 +40,85 @@ public:
 	 */
 	virtual const char* getName() const = 0;
 
-	// ===== Argument Parsing =====
+	// ===== Static Factory Methods =====
+	// NOTE: These are implemented as static methods in each concrete action class
+	// They cannot be declared virtual here (C++ limitation) but follow this contract:
 
 	/**
-	 * Parse CLI arguments starting at given index
+	 * Create action(s) from CLI arguments (SMART - may add friends)
 	 *
-	 * @param index Current position in argv
-	 * @param argc Total argument count
-	 * @param argv Argument array
-	 * @return Number of arguments consumed (0 = not interested)
+	 * Static factory that:
+	 * - Parses CLI args starting at given index
+	 * - Creates configured action instance(s)
+	 * - May add "friend" actions based on semantic intent
+	 * - Returns vector of actions to add to chain
 	 *
-	 * Example:
-	 *   --delete-character 12345
-	 *   Should consume 2 arguments and return 2
+	 * @param args Vector of argument strings
+	 * @param startIndex Current position in args vector
+	 * @param consumed OUTPUT: Number of arguments consumed (0 = not interested)
+	 * @return Vector of actions (empty if not interested, 1+ if matched)
+	 *
+	 * Example implementation:
+	 *   static Vector<ActionBase*> fromArgs(const Vector<String>& args, int startIndex, int& consumed) {
+	 *       Vector<ActionBase*> result;
+	 *       consumed = 0;
+	 *       MyAction* me = nullptr;
+	 *
+	 *       int i = startIndex;
+	 *       while (i < args.size()) {
+	 *           int lastConsumed = consumed;
+	 *
+	 *           if (args.get(i) == "--my-flag" && i + 1 < args.size()) {
+	 *               if (me == nullptr) me = new MyAction();
+	 *               me->property = args.get(i + 1);
+	 *               consumed += 2;
+	 *               i += 2;
+	 *           }
+	 *
+	 *           if (consumed == lastConsumed) break;
+	 *       }
+	 *
+	 *       if (me != nullptr) {
+	 *           result.add(me);
+	 *           // Add friends based on configuration
+	 *           if (me->needsFriend) result.add(new FriendAction());
+	 *       }
+	 *
+	 *       return result;
+	 *   }
+	 *
+	 * CLI Convenience: May return multiple actions (me + friends)
+	 * Example: --character-firstname returns [selectContext, zoneInCharacter]
 	 */
-	virtual int parseArgs(int index, int argc, char** argv) = 0;
+	// static Vector<ActionBase*> fromArgs(const Vector<String>& args, int startIndex, int& consumed);
 
 	/**
-	 * Parse JSON configuration
+	 * Create action from JSON configuration (EXPLICIT - no friends)
+	 *
+	 * Static factory that:
+	 * - Parses JSON configuration object
+	 * - Creates single configured action instance
+	 * - NEVER adds friend actions (JSON must be explicit)
+	 * - Returns configured action or nullptr on error
 	 *
 	 * @param config JSON object for this action
+	 * @return Configured action instance (caller owns memory)
 	 *
-	 * Example JSON:
-	 *   {"action": "createCharacter", "name": "Foo", "race": "human"}
+	 * Example implementation:
+	 *   static ActionBase* fromJSON(const JSONSerializationType& config) {
+	 *       MyAction* me = new MyAction();
+	 *
+	 *       if (config.contains("property")) {
+	 *           me->property = config["property"].get<Type>();
+	 *       }
+	 *
+	 *       return me;
+	 *   }
+	 *
+	 * JSON Precision: Always returns exactly 1 action (or nullptr)
+	 * Users must specify complete action chains explicitly in JSON
 	 */
-	virtual void parseJSON(const JSONSerializationType& config) = 0;
+	// static ActionBase* fromJSON(const JSONSerializationType& config);
 
 	// ===== Requirements =====
 
@@ -80,6 +134,21 @@ public:
 	 *   - sendCommand: true (zone-phase action)
 	 */
 	virtual bool needsZone() const = 0;
+
+	/**
+	 * Does this action require a character to be selected?
+	 *
+	 * @return true if action needs character selected (triggers auto-insert of selectCharacter)
+	 *
+	 */
+	virtual bool needsCharacter() const { return false; }  // Default: not required
+
+	/**
+	 * Does this action require target context (character/galaxy selection)?
+	 *
+	 * @return true if action needs targetCharacterOid/targetGalaxyId (triggers auto-insert of selectContext)
+	 */
+	virtual bool needsTarget() const { return false; }  // Default: not required
 
 	// ===== Execution =====
 

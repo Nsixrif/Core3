@@ -8,8 +8,9 @@
 #include "client/zone/managers/objectcontroller/ObjectController.h"
 #include "server/zone/packets/charcreation/ClientCreateCharacter.h"
 
-ZonePacketHandler::ZonePacketHandler(const String& s, Zone * z) : Logger(s) {
+ZonePacketHandler::ZonePacketHandler(const String& s, Zone* z, ClientCore* clientCore) : Logger(s) {
 	zone = z;
+	core = clientCore;
 
 	setLogging(true);
 	setGlobalLogging(true);
@@ -54,6 +55,9 @@ void ZonePacketHandler::handleMessage(Message* pack) {
 		break;
 	case 3:
 		switch (opcode) {
+		CASE_OPCODE("ErrorMessage");
+			handleErrorMessage(pack);
+			break;
 		CASE_OPCODE("ClientCreateCharacterFailed");
 			handleClientCreateCharacterFailed(pack);
 			break;
@@ -76,6 +80,10 @@ void ZonePacketHandler::handleMessage(Message* pack) {
 		switch (opcode) {
 		CASE_OPCODE("ClientPermissionsMessage");
 			handleClientPermissionsMessage(pack);
+			break;
+
+		CASE_OPCODE("ClientRandomNameResponse");
+			handleClientRandomNameResponse(pack);
 			break;
 
 		CASE_OPCODE("UpdateContainmentMessage");
@@ -134,6 +142,11 @@ void ZonePacketHandler::handleMessage(Message* pack) {
 	}
 
 	debug() << __FUNCTION__ << ": " << what << "(opcount=" << opcount << ", opcode=0x" << uppercase << hex << opcode << ")";
+
+	// Auto-signal for all recognized packets (signal() ignores if no waiter)
+	if (!what.isEmpty() && what != "unknown") {
+		zone->signal(opcode);
+	}
 }
 
 void ZonePacketHandler::handleClientPermissionsMessage(Message* pack) {
@@ -144,37 +157,14 @@ void ZonePacketHandler::handleClientPermissionsMessage(Message* pack) {
 	bool canCreateJediCharacter = pack->parseByte();
 	bool canSkipTutorial = pack->parseByte();
 
+	// Store permissions on zone for actions to check
+	zone->setPermissions(canLogin, canCreateRegularCharacter, canCreateJediCharacter, canSkipTutorial);
+
+	info(true) << "Client permissions received:";
 	info(true) << "    canLogin = " << canLogin;
-	info(true) << "    canCreateRegularCharacter = " << canCreateRegularCharacter;
-	info(true) << "    canCreateJediCharacter = " << canCreateJediCharacter;
+	info(true) << "    canCreateCharacter = " << canCreateRegularCharacter;
+	info(true) << "    canCreateJedi = " << canCreateJediCharacter;
 	info(true) << "    canSkipTutorial = " << canSkipTutorial;
-
-	BaseClient* client = (BaseClient*) pack->getClient();
-
-	// Check if we should create a character
-	bool shouldCreate = (zone->getCharacterID() == 0)
-	                    && ClientCore::shouldCreateCharacter()
-	                    && canCreateRegularCharacter;
-
-	if (shouldCreate) {
-		info(true) << "No character found - creating new character...";
-
-		BaseMessage* createChar = ClientCore::buildCreateCharacterPacket();
-		client->sendPacket(createChar);
-
-		// Wait for ClientCreateCharacterSuccess or ClientCreateCharacterFailed
-		// Success handler will send SelectCharacter automatically
-
-	} else if (zone->getCharacterID() == 0) {
-		client->error() << "No character OID and creation not enabled/permitted";
-		throw Exception("ClientPermissionsMessage: No character to select");
-
-	} else {
-		info(true) << "Sending SelectCharacter(" << zone->getCharacterID() << ")";
-
-		BaseMessage* selectChar = new SelectCharacter(zone->getCharacterID());
-		client->sendPacket(selectChar);
-	}
 }
 
 void ZonePacketHandler::handleCmdStartScene(Message* pack) {
@@ -196,7 +186,15 @@ void ZonePacketHandler::handleCmdStartScene(Message* pack) {
 
 	uint64 galacticTime = pack->parseLong();
 
-	zone->setCharacterID(selfPlayerObjectID);
+	// Server confirms our character OID
+	if (core->selectedCharacterOid != selfPlayerObjectID) {
+		error() << "Scene starting for wrong OID: " << selfPlayerObjectID
+			<< "; expected OID: " << core->selectedCharacterOid
+			<< "; aborting Scene.";
+		return;
+	}
+
+	info(true) << "Scene Starting for character OID: " << selfPlayerObjectID;
 
 	BaseMessage* msg = new CmdSceneReady();
 	client->sendPacket(msg);
@@ -359,7 +357,8 @@ void ZonePacketHandler::handleClientCreateCharacterSuccess(Message* pack) {
 
 	info(true) << "Character creation SUCCESS - OID: " << newCharacterOID;
 
-	zone->setCharacterCreated(newCharacterOID);
+	// Store in vars
+	core->setVar("ClientCreateCharacterSuccess/oid", newCharacterOID);
 
 	// Now send SelectCharacter with the new OID
 	BaseClient* client = (BaseClient*) pack->getClient();
@@ -383,5 +382,50 @@ void ZonePacketHandler::handleClientCreateCharacterFailed(Message* pack) {
 	error() << "  Error code: " << errorCode;
 	error() << "  UI file: " << uiFile;
 
-	zone->setCharacterCreationFailed();
+	// Store in vars
+	core->setVar("ClientCreateCharacterFailed/errorCode", errorCode);
+	core->setVar("ClientCreateCharacterFailed/uiFile", uiFile);
+}
+
+void ZonePacketHandler::handleErrorMessage(Message* pack) {
+	info(true) << __FUNCTION__;
+
+	String errorType, errorMessage;
+	pack->parseAscii(errorType);
+	pack->parseAscii(errorMessage);
+
+	error() << "Zone ERROR: " << errorType << " - " << errorMessage;
+
+	// Store in vars
+	core->setVar("ErrorMessage/type", errorType);
+	core->setVar("ErrorMessage/message", errorMessage);
+	core->setVar("ErrorMessage/source", "ZonePacketHandler");
+
+	zone->setError(errorMessage, 1);
+}
+
+void ZonePacketHandler::handleClientRandomNameResponse(Message* pack) {
+	info(true) << __FUNCTION__;
+
+	String templatePath;
+	pack->parseAscii(templatePath);
+
+	UnicodeString suggestedName;
+	pack->parseUnicode(suggestedName);
+
+	uint32 unused1 = pack->parseInt();
+	uint32 unused2 = pack->parseInt();
+
+	String approvalStatus;
+	pack->parseAscii(approvalStatus);
+
+	info(true) << "Random name response:";
+	info(true) << "  Template: " << templatePath;
+	info(true) << "  Suggested name: " << suggestedName.toString();
+	info(true) << "  Approval: " << approvalStatus;
+
+	// Store in vars
+	core->setVar("ClientRandomNameResponse/name", suggestedName.toString());
+	core->setVar("ClientRandomNameResponse/template", templatePath);
+	core->setVar("ClientRandomNameResponse/approval", approvalStatus);
 }

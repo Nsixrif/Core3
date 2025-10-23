@@ -29,8 +29,8 @@ private:
 
 public:
 	SquadronObserver();
-
 	SquadronObserver(ShipAiAgent* shipAgent);
+	SquadronObserver(ShipAiAgent* shipAgent, int formationType);
 
 	~SquadronObserver();
 
@@ -39,7 +39,7 @@ public:
 	// Mutators
 	void updateSquadron();
 
-	void addSquadronShip(ShipAiAgent* shipAgent);
+	void addSquadronShip(ShipAiAgent* shipAgent, bool makeLeader = false);
 
 	void dropSquadronShip(ShipAiAgent* shipAgent);
 

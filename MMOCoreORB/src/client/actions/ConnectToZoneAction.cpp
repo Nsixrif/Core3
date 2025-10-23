@@ -27,17 +27,26 @@ public:
 		return "connectToZone";
 	}
 
-	int parseArgs(int index, int argc, char** argv) override {
-		// No CLI arguments - auto-inserted by framework
-		return 0;
-	}
-
-	void parseJSON(const JSONSerializationType& config) override {
-		// No JSON configuration needed
-	}
-
 	bool needsZone() const override {
 		return false;  // This action CREATES the zone connection
+	}
+
+	// ===== Static Factories =====
+
+	static Vector<ActionBase*> fromArgs(const Vector<String>& args, int startIndex, int& consumed) {
+		Vector<ActionBase*> result;
+		consumed = 0;
+		// ConnectToZone has no CLI args - always auto-inserted by dependency resolution
+		return result;
+	}
+
+	static ActionBase* fromJSON(const JSONSerializationType& config) {
+		// ConnectToZone has no configuration
+		return new ConnectToZoneAction();
+	}
+
+	bool needsTarget() const override {
+		return false;  // Target is optional - falls back to first galaxy
 	}
 
 	void run(ClientCore& core) override {
@@ -53,94 +62,61 @@ public:
 			core.loginSession->cleanup();
 		}
 
-		// Determine which character to zone into
-		uint64 characterOid = 0;
-		uint32 galaxyId = 0;
-		auto numCharacters = core.loginSession->getCharacterListSize();
-
-		if (numCharacters > 0) {
-			// Select character based on options
-			Optional<const CharacterListEntry&> character;
-
-			if (core.options.characterOid != 0) {
-				character = core.loginSession->selectCharacterByOID(core.options.characterOid);
-				if (!character) {
-					result.setError("Character OID not found in account", 2);
-					return;
-				}
-			} else if (!core.options.characterFirstname.isEmpty()) {
-				character = core.loginSession->selectCharacterByFirstname(core.options.characterFirstname);
-				if (!character) {
-					result.setError("Character firstname not found in account", 3);
-					return;
-				}
-			} else {
-				// Select random character
-				character = core.loginSession->selectRandomCharacter();
-			}
-
-			if (!character) {
-				result.setError("Failed to select any character", 4);
-				return;
-			}
-
-			characterOid = character->getObjectID();
-			galaxyId = character->getGalaxyID();
-
-			info() << "Selected character: " << character->getFirstName() << " (OID: " << characterOid << ")";
-		} else {
-			// No characters - will create in zone (if createCharacter flag is set)
-			if (!core.options.createCharacter) {
-				result.setError("No characters on account and character creation not enabled", 5);
-				return;
-			}
-
-			// Use first available galaxy
-			auto& galaxyMap = core.loginSession->getGalaxies();
-			if (galaxyMap.size() == 0) {
-				result.setError("No galaxies available", 6);
-				return;
-			}
-			galaxyId = galaxyMap.get(0).getID();
-			info() << "No characters - will create new character on galaxy " << galaxyId;
+		// Get target galaxy (from selectContext or default to first)
+		auto& galaxyMap = core.loginSession->getGalaxies();
+		if (galaxyMap.size() == 0) {
+			result.setError("No galaxies available", 2);
+			return;
 		}
 
-		// Get galaxy info
-		auto& galaxy = core.loginSession->getGalaxy(galaxyId);
+		// Use targetGalaxyId if set, otherwise first galaxy
+		Galaxy galaxy;
+		bool found = false;
+
+		if (core.targetGalaxyId != 0) {
+			galaxy = core.loginSession->getGalaxy(core.targetGalaxyId);
+			if (!galaxy.getAddress().isEmpty()) {
+				found = true;
+				info() << "Using target galaxy: " << galaxy.getName() << " (ID: " << core.targetGalaxyId << ")";
+			} else {
+				warning() << "Target galaxy " << core.targetGalaxyId << " not found, using first galaxy";
+			}
+		}
+
+		if (!found) {
+			galaxy = galaxyMap.get(0);
+			info() << "Using default galaxy: " << galaxy.getName() << " (ID: " << galaxy.getID() << ")";
+		}
+
 		if (galaxy.getAddress().isEmpty()) {
-			result.setError("Invalid galaxy - missing IP address", 7);
+			result.setError("Invalid galaxy - missing IP address", 3);
 			return;
 		}
 
 		info() << "Connecting to zone: " << galaxy.getName()
 		       << " at " << galaxy.getAddress() << ":" << galaxy.getPort();
 
-		// Create and start zone connection
+		// Create and start zone connection (just socket, no packets)
+		// SelectCharacterAction or CreateCharacterAction will handle character selection
 		uint32 accountId = core.loginSession->getAccountID();
 		const String& sessionId = core.loginSession->getSessionID();
 
-		core.zone = new Zone(characterOid, accountId, sessionId, galaxy.getAddress(), galaxy.getPort());
+		core.zone = new Zone(&core, accountId, sessionId, galaxy.getAddress(), galaxy.getPort());
 		core.zone->start();
 
-		// Wait for zone connection
-		int zoneTimeout = ClientCore::getZoneTimeout() * 1000;
-		if (!core.zone->waitForSceneReady(zoneTimeout)) {
-			result.setError(
-				core.zone->getLastError().isEmpty()
-					? "Zone connection timeout"
-					: core.zone->getLastError(),
-				core.zone->getLastErrorCode() != 0
-					? core.zone->getLastErrorCode()
-					: 8
-			);
+		// Wait briefly for connection to establish
+		Thread::sleep(100);
+
+		if (!core.zone->isConnected()) {
+			result.setError("Zone connection failed", 4);
 			return;
 		}
 
-		// Success
+		// Success - zone connection established
 		result.setSuccess();
-		result.setZoneInfo(galaxy.getAddress(), galaxy.getPort(), characterOid);
+		result.setZoneInfo(galaxy.getAddress(), galaxy.getPort(), 0);
 
-		info() << "Zone connection established successfully";
+		info() << "Zone connection established";
 	}
 
 	bool isOK() const override {
@@ -180,7 +156,7 @@ public:
 	}
 
 	String getHelpText() const override {
-		return "connectToZone: Connect to zone server (auto-inserted before zone actions)";
+		return "";  // Auto-inserted, no user-facing options
 	}
 
 	// Factory function for static registration
@@ -191,4 +167,4 @@ public:
 
 // Static registration (runs before main())
 static bool _registered_connectToZone =
-	(ActionManager::registerAction("connectToZone", ConnectToZoneAction::factory), true);
+	(ActionManager::registerAction("connectToZone", ConnectToZoneAction::factory, ConnectToZoneAction::fromArgs, ConnectToZoneAction::fromJSON), true);

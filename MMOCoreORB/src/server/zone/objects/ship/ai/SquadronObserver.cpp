@@ -28,6 +28,17 @@ SquadronObserver::SquadronObserver(ShipAiAgent* shipAgent) {
 #endif // DEBUG_SQUADRONS
 }
 
+SquadronObserver::SquadronObserver(ShipAiAgent* shipAgent, int formationType) {
+	setLoggingName("SquadronObserver");
+	setFormationType(formationType);
+
+	addSquadronShip(shipAgent);
+
+#ifdef DEBUG_SQUADRONS
+	info(true) << "SquadronObserver:" << __FUNCTION__ << "() -- CONSTRUCTOR New Squadron Size: " << squadronAgents.size() << " Formation Type: " << squadronData.getFormationType() << " Formation Radius: " << squadronData.getFormationRadius() << " Agent: " << shipAgent->getShipAgentTemplateName();
+#endif // DEBUG_SQUADRONS
+}
+
 SquadronObserver::~SquadronObserver() {
 	squadronAgents.removeAll();
 
@@ -48,10 +59,6 @@ void SquadronObserver::updateSquadron() {
 	if (leader == nullptr || !leader->isShipLaunched() || leader->isDisabled()) {
 		return;
 	}
-
-#ifdef DEBUG_SQUADRONS
-	info(true) << "SquadronObserver:" << __FUNCTION__ << "() -- Squadron Leader: " << leader->getShipName() << " ID: " << leader->getObjectID();
-#endif // DEBUG_SQUADRONS
 
 	const auto& lMatrix = *leader->getConjugateMatrix();
 	const auto& lTransform = leader->getNextTransform();
@@ -90,17 +97,24 @@ void SquadronObserver::updateSquadron() {
 	squadronData.setSpeed(0, nextSpeed);
 }
 
-void SquadronObserver::addSquadronShip(ShipAiAgent* shipAgent) {
+void SquadronObserver::addSquadronShip(ShipAiAgent* shipAgent, bool makeLeader) {
 	Locker lock(&mutex);
 
 	if (shipAgent == nullptr || squadronAgents.find(shipAgent) != -1) {
 		return;
 	}
 
-	squadronAgents.add(shipAgent);
-	squadronData.add(shipAgent);
+	if (!makeLeader || squadronAgents.size() < 1) {
+		squadronAgents.add(shipAgent);
+		squadronData.add(shipAgent);
 
-	setFormationType(squadronData.getFormationType(), squadronData.getFormationRadius());
+		setFormationType(squadronData.getFormationType(), squadronData.getFormationRadius());
+	} else {
+		ShipAiAgent* temp = squadronAgents.set(0, shipAgent);
+		squadronAgents.add(temp);
+
+		squadronData.makeLeader(shipAgent);
+	}
 
 #ifdef DEBUG_SQUADRONS
 	info(true) << "SquadronObserver:" << __FUNCTION__ << "() -- New Squadron Size: " << squadronAgents.size() << " Formation Type: " << squadronData.getFormationType() << " Formation Radius: " << squadronData.getFormationRadius();

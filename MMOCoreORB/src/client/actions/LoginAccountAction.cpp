@@ -24,26 +24,32 @@ public:
 		return "loginAccount";
 	}
 
-	int parseArgs(int index, int argc, char** argv) override {
-		// No CLI arguments for this action
-		// Uses ClientCoreOptions.username/password
-		return 0;
-	}
-
-	void parseJSON(const JSONSerializationType& config) override {
-		// JSON can override username/password if needed
-		// For Phase 1, we just use ClientCoreOptions
-	}
-
 	bool needsZone() const override {
 		return false;  // Login-phase action
 	}
 
+	// ===== Static Factories =====
+
+	static Vector<ActionBase*> fromArgs(const Vector<String>& args, int startIndex, int& consumed) {
+		Vector<ActionBase*> result;
+		consumed = 0;
+		// LoginAccount has no CLI args - always auto-inserted
+		return result;
+	}
+
+	static ActionBase* fromJSON(const JSONSerializationType& config) {
+		// LoginAccount has no configuration - always auto-inserted
+		return new LoginAccountAction();
+	}
+
 	void run(ClientCore& core) override {
-		info() << "Authenticating account: " << core.options.username;
+		String username = String(core.options.config["username"].get<std::string>().c_str());
+		String password = String(core.options.config["password"].get<std::string>().c_str());
+
+		info() << "Authenticating account: " << username;
 
 		// Create and run login session
-		core.loginSession = new LoginSession(core.options.username, core.options.password);
+		core.loginSession = new LoginSession(username, password);
 		core.loginSession->run();
 
 		// Check if authentication succeeded
@@ -108,7 +114,7 @@ public:
 	}
 
 	String getHelpText() const override {
-		return "loginAccount: Authenticate to login server (auto-inserted, uses --username/--password)";
+		return "";  // Auto-inserted, no user-facing options
 	}
 
 	// Factory function for static registration
@@ -119,4 +125,4 @@ public:
 
 // Static registration (runs before main())
 static bool _registered_loginAccount =
-	(ActionManager::registerAction("loginAccount", LoginAccountAction::factory), true);
+	(ActionManager::registerAction("loginAccount", LoginAccountAction::factory, LoginAccountAction::fromArgs, LoginAccountAction::fromJSON), true);
