@@ -758,14 +758,10 @@ void ShipObjectImplementation::updatePlayersInShip(bool lightUpdate, bool sendPa
 			continue;
 		}
 
-		if (parent != thisShip) {
-			auto parentPosition = parent->getPosition();
-
-			shipMember->setPosition(parentPosition.getX(), parentPosition.getZ(), parentPosition.getY());
-			shipMember->updateZoneWithParent(parent, lightUpdate, sendPackets);
-		} else {
-			shipMember->setPosition(worldPosition.getX(), worldPosition.getZ(), worldPosition.getY());
+		if (parent == thisShip) {
 			shipMember->updateZoneWithParent(thisShip, lightUpdate, sendPackets);
+		} else {
+			shipMember->updateZoneWithParent(parent, lightUpdate, sendPackets);
 		}
 	}
 }
@@ -2806,6 +2802,6 @@ float ShipObjectImplementation::getNextRotation() {
 	return shipTransform.getNextRotation();
 }
 
-Vector3 ShipObjectImplementation::getPlayerLocationInShip(const Vector3& playerPosition) {
-	return SpaceMath::getGlobalVector(playerPosition, conjugateMatrix) + getWorldPosition();
+Vector3 ShipObjectImplementation::getObjectLocationInShip(SceneObject* object, const Vector3& objectPosition) {
+	return getWorldPosition();
 }
