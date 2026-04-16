@@ -374,6 +374,7 @@ void ObjectManager::registerObjectTypes() {
 	objectFactory.registerObject<SpaceSpawnArea>(SceneObjectType::SPACESPAWNAREA);
 	objectFactory.registerObject<SpaceSpawner>(SceneObjectType::SPACESPAWNER);
 	objectFactory.registerObject<CreditChipObject>(SceneObjectType::CREDITCHIP);
+	objectFactory.registerObject<ShipPaintKit>(SceneObjectType::SHIPPAINTKIT);
 
 	objectFactory.registerObject<SpaceshipTerminal>(SceneObjectType::SPACETERMINAL);
 	objectFactory.registerObject<ShipObject>(SceneObjectType::SHIP);
@@ -1102,17 +1103,17 @@ void ObjectManager::onCommitData() {
 		int mins = ConfigManager::instance()->getPurgeDeletedCharacters();
 		deleteCharactersTask->schedule(mins * 60 * 1000);
 	}
-#if NDEBUG
+#ifdef WITH_DEV_MODE
 	// Enable rapid create/delete of characters for test harness
 	if (deleteCharactersTask != nullptr) {
-		info(true) << "NDEBUG: Forcing deleteCharactersTask->updateDeletedCharacters();";
+		info(true) << "DEV_MODE: Forcing deleteCharactersTask->updateDeletedCharacters();";
 		deleteCharactersTask->updateDeletedCharacters();
-		info(true) << "NDEBUG: Forcing deleteCharactersTask->executeInThread();";
+		info(true) << "DEV_MODE: Forcing deleteCharactersTask->executeInThread();";
 		deleteCharactersTask->executeInThread();
-		info(true) << "NDEBUG: Forcing deleteCharactersTask->updateDeletedCharacters();";
+		info(true) << "DEV_MODE: Forcing deleteCharactersTask->updateDeletedCharacters();";
 		deleteCharactersTask->updateDeletedCharacters();
 	}
-#endif
+#endif // WITH_DEV_MODE
 }
 
 void ObjectManager::cancelDeleteCharactersTask() {
