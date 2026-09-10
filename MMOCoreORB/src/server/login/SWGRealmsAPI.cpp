@@ -55,11 +55,26 @@ private:
 	uint32 accountID;
 	bool accountIDOnly;
 
+	// Parsed fields - populated by parse() on the cpprestsdk thread,
+	// applied to the Account managed object by applyToManagedObject()
+	// on a Core3 task thread.
+	uint32 stationID;
+	String username;
+	bool active;
+	uint32 adminLevel;
+	uint32 created;
+	uint32 banExpires;
+	String banReason;
+	uint32 banAdmin;
+	Time validUntil;
+	bool parsedFullAccount;  // false in accountIDOnly mode or on parse failure
+
 public:
 	AccountResult(Reference<account::Account*> acc);
 	AccountResult();
 
 	bool parse() override;
+	void applyToManagedObject() override;
 
 	inline uint32 getAccountID() const {
 		return accountID;
@@ -82,6 +97,12 @@ public:
 
 using namespace server::login;
 
+static bool streamingEnabled = true;
+
+void SWGRealmsAPI::disableStreaming() {
+	streamingEnabled = false;
+}
+
 SWGRealmsAPI::SWGRealmsAPI() {
 	trxCount = 0;
 
@@ -95,6 +116,12 @@ SWGRealmsAPI::SWGRealmsAPI() {
 	setLogging(true);
 
 	auto config = ConfigManager::instance();
+
+	// Spawn queue workers now so first-time BDB handle init can't land mid-save.
+	auto taskManager = Core::getTaskManager();
+	blockingQueue  = taskManager->initializeCustomQueue("SWGRealmsAPI", config->getInt("Core3.Login.API.WorkerThreads", 4));
+	signalQueue  = taskManager->initializeCustomQueue("SWGRealmsSignal", 1, false);
+	metricsQueue = taskManager->initializeCustomQueue("SWGRealmsMetrics", 1);
 
 	debugLevel = config->getInt("Core3.Login.API.DebugLevel", 0);
 
@@ -131,9 +158,29 @@ SWGRealmsAPI::SWGRealmsAPI() {
 	client_config.set_validate_certificates(false);
 	client_config.set_timeout(utility::seconds(apiTimeoutMs / 1000));
 
-	httpClient = new http_client(baseURL.toCharArray(), client_config);
+	// http_client ctor parses baseURL as an RFC 3986 URI and throws uri_exception
+	// on malformed input (missing scheme, unencoded space, etc.). Disable the
+	// API cleanly instead of crashing init - admin will see a clear error and
+	// every subsequent apiCall will fail-closed via the !apiEnabled branch.
+	try {
+		httpClient = new http_client(baseURL.toCharArray(), client_config);
+	} catch (const std::exception& e) {
+		error() << "Failed to construct http_client (BaseURL='" << baseURL << "'): " << e.what() << " - API DISABLED";
+		apiEnabled = false;
+		return;
+	}
 
-	streamer = new SWGRealmsStreamer(baseURL, apiToken, galaxyID, debugLevel);
+	// Streamer failure is non-fatal: API can still serve approvals, only the
+	// telemetry/event stream is lost. Downstream code already guards on
+	// streamer != nullptr.
+	if (streamingEnabled) {
+		try {
+			streamer = new SWGRealmsStreamer(baseURL, apiToken, galaxyID, debugLevel);
+		} catch (const std::exception& e) {
+			error() << "Failed to construct SWGRealmsStreamer: " << e.what() << " - streaming disabled, API still active";
+			streamer = nullptr;
+		}
+	}
 
 	info(true) << "Starting " << toString();
 }
@@ -191,7 +238,7 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 
 		Core::getTaskManager()->executeTask([result]() {
 			result->invokeCallback();
-		}, "SWGRealmsAPIResult-nop-" + src, getCustomQueue()->getName());
+		}, "SWGRealmsAPIResult-nop-" + src, blockingQueue->getName());
 		return;
 	}
 
@@ -245,15 +292,53 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 
 	req.headers().add(U("Authorization"), authHeader.toCharArray());
 
-	req.set_request_uri(apiPath.toCharArray());
+	// set_request_uri parses apiPath as an RFC 3986 URI and throws uri_exception
+	// on invalid input (e.g. an unencoded space). httpClient->request can also
+	// throw synchronously. If either escapes apiCall(), the callback never
+	// fires and apiCallBlocking parks on its condvar until the timeout — and
+	// outstandingBlockingCalls leaks. Fail the result cleanly and schedule the
+	// callback so blocking callers wake up.
+	try {
+		req.set_request_uri(apiPath.toCharArray());
 
-	if (!body.isEmpty()) {
-		req.set_body(body.toCharArray(), "application/json");
+		if (!body.isEmpty()) {
+			req.set_body(body.toCharArray(), "application/json");
+		}
+
+		API_TRACE(result, "http_request_sent");
+	} catch (const std::exception& e) {
+		incrementErrorCount();
+		error() << logPrefix << "Exception preparing request [path=" << apiPath << "]: " << e.what();
+
+		result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
+		result->setTitle("Temporary Server Error");
+		result->setMessage("Failed to build API request");
+		result->setDetails(String("Exception: ") + e.what());
+		result->setDebugValue("http_status", "0");
+		result->setElapsedTimeMS(startTime.miliDifference());
+
+		auto queue = result->blockDuringSaveEvent ? blockingQueue : signalQueue;
+		auto clientTrxId = result->getClientTrxId();
+
+		Core::getTaskManager()->executeTask([result, clientTrxId, this] {
+			API_TRACE(result, "callback_invoked");
+
+			if (!result->isBlockingCall) {
+				try {
+					result->applyToManagedObject();
+				} catch (const std::exception& e2) {
+					error() << clientTrxId << " applyToManagedObject exception: " << e2.what();
+				}
+			}
+
+			result->invokeCallback();
+		}, "SWGRealmsAPIResult-exception-" + src, queue->getName());
+
+		return;
 	}
 
-	API_TRACE(result, "http_request_sent");
-
-	httpClient->request(req)
+	try {
+		httpClient->request(req)
 		.then([this, src, apiPath, result](pplx::task<http_response> task) {
 			auto logPrefix = result->getClientTrxId() + " " + src + ": ";
 			http_response resp;
@@ -262,15 +347,20 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 			try {
 				resp = task.get();
 				API_TRACE(result, "http_response_received");
-			} catch (const http_exception& e) {
-				error() << logPrefix << apiPath << " HTTP Exception caught: " << e.what();
+			} catch (const std::exception& e) {
+				error() << logPrefix << apiPath << " Exception caught: " << e.what();
 				failed = true;
 			}
 
-			if (failed || resp.status_code() != 200) {
+			// resp is default-constructed if task.get() threw; don't trust
+			// resp.status_code() in that case. Use a local int we control.
+			int status = failed ? 0 : resp.status_code();
+			result->setDebugValue("http_status", String::valueOf(status));
+
+			if (failed || status != 200) {
 				incrementErrorCount();
 
-				error() << logPrefix << "HTTP Status " << resp.status_code() << " returned.";
+				error() << logPrefix << "HTTP Status " << status << " returned.";
 
 				auto json_err = json::value();
 
@@ -284,7 +374,7 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 					buf << "Exception caught handling request, ";
 				}
 
-				buf << "http_response.status_code() == " << resp.status_code();
+				buf << "http_response.status_code() == " << status;
 
 				json_err[U("details")] = json::value::string(U(buf.toString().toCharArray()));
 
@@ -295,64 +385,83 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 		}).then([this, src, method, apiPath, result, startTime](pplx::task<json::value> task) {
 			auto logPrefix = result->getClientTrxId() + " " + src + ": ";
 			auto result_json = json::value();
-			bool failed = false;
 
 			try {
 				result_json = task.get();
-			} catch (const http_exception& e) {
-				error() << logPrefix << " " << apiPath << " HTTP Exception caught reading body: " << e.what();
-				failed = true;
+			} catch (const std::exception& e) {
+				error() << logPrefix << " " << apiPath << " Exception caught reading body: " << e.what();
 			}
 
-			if (result_json.is_null()) {
-				incrementErrorCount();
-				error() << logPrefix << "Null JSON result from server.";
-				result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
-				result->setTitle("Temporary Server Error");
-				result->setMessage("If the error continues please contact support and mention error code = K");
-			} else {
-				result->setJSONObject(result_json);
-
-				if (result_json.has_field("action")) {
-					result->setAction(String(result_json[U("action")].as_string().c_str()));
-				} else if (failOpen) {
-					warning() << logPrefix << "Missing action from result, failing to ALLOW: JSON: " << result_json.serialize().c_str();
-					result->setAction(SWGRealmsAPIResult::ApprovalAction::ALLOW);
-				} else {
+			// Wrap body processing so any unexpected exception still reaches
+			// the callback scheduling path below - blocking callers must not
+			// hang on a swallowed throw.
+			try {
+				if (result_json.is_null()) {
 					incrementErrorCount();
+					error() << logPrefix << "Null JSON result from server.";
 					result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
 					result->setTitle("Temporary Server Error");
-					result->setMessage("If the error continues please contact support and mention error code = L");
-					result->setDetails("Missing action field from server");
-				}
+					result->setMessage("If the error continues please contact support and mention error code = K");
+				} else {
+					result->setJSONObject(result_json);
 
-				if (result_json.has_field("title")) {
-					result->setTitle(String(result_json[U("title")].as_string().c_str()));
-				}
-
-				if (result_json.has_field("message")) {
-					result->setMessage(String(result_json[U("message")].as_string().c_str()));
-				}
-
-				if (result_json.has_field("details")) {
-					result->setDetails(String(result_json[U("details")].as_string().c_str()));
-				}
-
-				if (result_json.has_field("debug")) {
-					auto debug = result_json[U("debug")];
-
-					if (debug.has_field("trx_id")) {
-						result->setDebugValue("trx_id", String(debug[U("trx_id")].as_string().c_str()));
+					if (result_json.has_field("action")) {
+						result->setAction(String(result_json[U("action")].as_string().c_str()));
+					} else if (failOpen) {
+						warning() << logPrefix << "Missing action from result, failing to ALLOW: JSON: " << result_json.serialize().c_str();
+						result->setAction(SWGRealmsAPIResult::ApprovalAction::ALLOW);
+					} else {
+						incrementErrorCount();
+						result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
+						result->setTitle("Temporary Server Error");
+						result->setMessage("If the error continues please contact support and mention error code = L");
+						result->setDetails("Missing action field from server");
 					}
 
-					if (debug.has_field("req_time_ms")) {
-						result->setDebugValue("req_time_ms", String::valueOf(debug[U("req_time_ms")].as_integer()));
+					if (result_json.has_field("title")) {
+						result->setTitle(String(result_json[U("title")].as_string().c_str()));
 					}
-				}
 
-				// Call subclass parse() to extract type-specific fields
-				result->parse();
-				API_TRACE(result, "json_parsed");
+					if (result_json.has_field("message")) {
+						result->setMessage(String(result_json[U("message")].as_string().c_str()));
+					}
+
+					if (result_json.has_field("details")) {
+						result->setDetails(String(result_json[U("details")].as_string().c_str()));
+					}
+
+					if (result_json.has_field("debug")) {
+						auto debug = result_json[U("debug")];
+
+						if (debug.has_field("trx_id")) {
+							result->setDebugValue("trx_id", String(debug[U("trx_id")].as_string().c_str()));
+						}
+
+						if (debug.has_field("req_time_ms")) {
+							result->setDebugValue("req_time_ms", String::valueOf(debug[U("req_time_ms")].as_integer()));
+						}
+					}
+
+					// Call subclass parse() to extract type-specific fields.
+					// A parse failure on a success response means the server
+					// sent malformed data - degrade to TEMPFAIL so callers
+					// see it instead of using a half-populated object.
+					if (!result->parse() && result->isActionAllowed()) {
+						incrementErrorCount();
+						error() << logPrefix << "Response parse() failed on ALLOW response: " << result_json.serialize().c_str();
+						result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
+						result->setTitle("Temporary Server Error");
+						result->setMessage("Failed to parse API response body");
+						result->setDetails("Subclass parse() rejected response JSON");
+					}
+					API_TRACE(result, "json_parsed");
+				}
+			} catch (const std::exception& e) {
+				incrementErrorCount();
+				error() << logPrefix << "Unhandled exception processing response: " << e.what();
+				result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
+				result->setTitle("Temporary Server Error");
+				result->setMessage(String("Unhandled exception processing response: ") + e.what());
 			}
 
 			result->setElapsedTimeMS(startTime.miliDifference());
@@ -374,12 +483,10 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 
 			API_TRACE(result, "queue_scheduled");
 
-			// Use signal queue for blocking calls (just broadcast completion)
-			// Use main queue for async calls (may modify managed objects)
-			auto queue = result->useSignalQueue ? getSignalQueue() : getCustomQueue();
+			auto queue = result->blockDuringSaveEvent ? blockingQueue : signalQueue;
 
 			// Track queue depth before submitting - warn on new peaks (main queue only)
-			if (!result->useSignalQueue) {
+			if (result->blockDuringSaveEvent) {
 				int queueDepth = queue->size();
 				int peak = peakQueueDepth.get();
 				while (queueDepth > peak) {
@@ -399,9 +506,47 @@ void SWGRealmsAPI::apiCall(Reference<SWGRealmsAPIResult*> result, const String& 
 				if (delayMs > 1000) {
 					warning() << clientTrxId << " callback delay: " << delayMs << "ms";
 				}
+
+				// Blocking calls apply on the caller thread after wait_for; everything else applies here.
+				if (!result->isBlockingCall) {
+					try {
+						result->applyToManagedObject();
+					} catch (const std::exception& e) {
+						error() << clientTrxId << " applyToManagedObject exception: " << e.what();
+					}
+				}
+
 				result->invokeCallback();
 			}, "SWGRealmsAPIResult-" + src, queue->getName());
 		});
+	} catch (const std::exception& e) {
+		incrementErrorCount();
+		error() << logPrefix << "Exception dispatching request [path=" << apiPath << "]: " << e.what();
+
+		result->setAction(SWGRealmsAPIResult::ApprovalAction::TEMPFAIL);
+		result->setTitle("Temporary Server Error");
+		result->setMessage("Failed to dispatch API request");
+		result->setDetails(String("Exception: ") + e.what());
+		result->setDebugValue("http_status", "0");
+		result->setElapsedTimeMS(startTime.miliDifference());
+
+		auto queue = result->blockDuringSaveEvent ? blockingQueue : signalQueue;
+		auto clientTrxId = result->getClientTrxId();
+
+		Core::getTaskManager()->executeTask([result, clientTrxId, this] {
+			API_TRACE(result, "callback_invoked");
+
+			if (!result->isBlockingCall) {
+				try {
+					result->applyToManagedObject();
+				} catch (const std::exception& e2) {
+					error() << clientTrxId << " applyToManagedObject exception: " << e2.what();
+				}
+			}
+
+			result->invokeCallback();
+		}, "SWGRealmsAPIResult-exception-" + src, queue->getName());
+	}
 }
 
 void SWGRealmsAPI::apiNotify(const String& src, const String& basePath) {
@@ -411,8 +556,8 @@ void SWGRealmsAPI::apiNotify(const String& src, const String& basePath) {
 		}
 	});
 
-	// Fire-and-forget notifications use signal queue - callback just logs, doesn't modify objects
-	result->useSignalQueue = true;
+	// Save manager calls apiNotify during save; signal queue must run mid-save.
+	result->blockDuringSaveEvent = false;
 
 	apiCall(result.castTo<SWGRealmsAPIResult*>(), src, basePath);
 }
@@ -448,19 +593,44 @@ void SWGRealmsAPI::createSession(const String& username, const String& password,
 
 		Core::getTaskManager()->executeTask([result]() mutable {
 			result->invokeCallback();
-		}, "SWGRealmsAPIResult-nop-createSession", getCustomQueue()->getName());
+		}, "SWGRealmsAPIResult-nop-createSession", blockingQueue->getName());
 
 		return;
 	}
 
-	auto requestBody = json::value::object();
-	requestBody[U("username")] = json::value::string(U(username.toCharArray()));
-	requestBody[U("password")] = json::value::string(U(password.toCharArray()));
-	requestBody[U("client_version")] = json::value::string(U(clientVersion.toCharArray()));
-	requestBody[U("client_ip")] = json::value::string(U(clientEndpoint.toCharArray()));
-	requestBody[U("galaxy_id")] = json::value::number(galaxyID);
+	// username/password come straight off the wire from LoginClientId; if they
+	// contain invalid UTF-8 or fail JSON encoding, json::value::string() or
+	// serialize() can throw. Without this guard the login session callback
+	// never fires and the LoginClient parks until its own timeout (same hang
+	// class as the URI bug, but at every login attempt).
 
-	apiCall(result.castTo<SWGRealmsAPIResult*>(), __FUNCTION__, "/v1/core3/account/login", "POST", String(requestBody.serialize().c_str()));
+	try {
+		auto requestBody = json::value::object();
+		requestBody[U("username")] = json::value::string(U(username.toCharArray()));
+		requestBody[U("password")] = json::value::string(U(password.toCharArray()));
+		requestBody[U("client_version")] = json::value::string(U(clientVersion.toCharArray()));
+		requestBody[U("client_ip")] = json::value::string(U(clientEndpoint.toCharArray()));
+		requestBody[U("galaxy_id")] = json::value::number(galaxyID);
+
+		apiCall(result.castTo<SWGRealmsAPIResult*>(), __FUNCTION__, "/v1/core3/account/login", "POST", String(requestBody.serialize().c_str()));
+	} catch (const std::exception& e) {
+		incrementErrorCount();
+		error() << "createSession: failed to build login request body for username='" << username << "': " << e.what();
+
+		result->setAction(SWGRealmsAPIResult::ApprovalAction::REJECT);
+		result->setTitle("Login Error");
+		result->setMessage("If the error continues please contact support and mention error code = J");
+		result->setDetails(String("Exception building login request: ") + e.what());
+		result->setDebugValue("trx_id", "createSession-build-error");
+		result->setDebugValue("http_status", "0");
+
+		Core::getTaskManager()->executeTask([result]() mutable {
+			result->invokeCallback();
+		}, "SWGRealmsAPIResult-buildfail-createSession", blockingQueue->getName());
+
+		return;
+	}
+
 }
 
 void SWGRealmsAPI::approveNewSession(const String& ip, uint32 accountID, const SessionAPICallback& resultCallback) {
@@ -696,7 +866,8 @@ SWGRealmsAPIResult::SWGRealmsAPIResult() {
 	resultAction = ApprovalAction::UNKNOWN;
 	resultElapsedTimeMS = 0ull;
 	blockingReceived = false;
-	useSignalQueue = false;
+	blockDuringSaveEvent = true;
+	isBlockingCall = false;
 
 	resultDebug.setNullValue("<not set>");
 }
@@ -857,12 +1028,26 @@ AccountResult::AccountResult(Reference<Account*> acc) {
 	account = acc;
 	accountID = 0;
 	accountIDOnly = false;
+	stationID = 0;
+	active = false;
+	adminLevel = 0;
+	created = 0;
+	banExpires = 0;
+	banAdmin = 0;
+	parsedFullAccount = false;
 }
 
 AccountResult::AccountResult() {
 	account = nullptr;
 	accountID = 0;
 	accountIDOnly = true;  // This is for getAccountID() calls
+	stationID = 0;
+	active = false;
+	adminLevel = 0;
+	created = 0;
+	banExpires = 0;
+	banAdmin = 0;
+	parsedFullAccount = false;
 }
 
 bool AccountResult::parse() {
@@ -896,16 +1081,16 @@ bool AccountResult::parse() {
 			return false;
 		}
 
-		uint32 stationID = accountObj[U("station_id")].as_integer();
-		String username = conversions::to_utf8string(accountObj[U("username")].as_string());
-		bool active = accountObj[U("active")].as_bool();
-		uint32 adminLevel = accountObj.has_field(U("admin_level")) ? accountObj[U("admin_level")].as_integer() : 0;
-		uint32 created = accountObj.has_field(U("created")) ? accountObj[U("created")].as_integer() : 0;
+		stationID = accountObj[U("station_id")].as_integer();
+		username = conversions::to_utf8string(accountObj[U("username")].as_string());
+		active = accountObj[U("active")].as_bool();
+		adminLevel = accountObj.has_field(U("admin_level")) ? accountObj[U("admin_level")].as_integer() : 0;
+		created = accountObj.has_field(U("created")) ? accountObj[U("created")].as_integer() : 0;
 
 		// Ban fields
-		uint32 banExpires = 0;
-		String banReason = "";
-		uint32 banAdmin = 0;
+		banExpires = 0;
+		banReason = "";
+		banAdmin = 0;
 
 		if (accountObj.has_field(U("ban_expires"))) {
 			banExpires = accountObj[U("ban_expires")].as_integer();
@@ -920,7 +1105,7 @@ bool AccountResult::parse() {
 		}
 
 		// Parse valid_until for caching
-		Time validUntil;
+		validUntil = Time();
 		if (jsonData.has_field(U("valid_until"))) {
 			if (jsonData[U("valid_until")].is_number()) {
 				uint64 timestamp = jsonData[U("valid_until")].as_number().to_uint64();
@@ -931,25 +1116,11 @@ bool AccountResult::parse() {
 			}
 		}
 
-		// Update account object
-		Locker locker(account);
-		account->setAccountID(accountID);
-		account->setStationID(stationID);
-		account->setUsername(username);
-		account->setActive(active);
-		account->setAdminLevel(adminLevel);
-		account->setTimeCreated(created);
-		account->setBanExpires(banExpires);
-		account->setBanReason(banReason);
-		account->setBanAdmin(banAdmin);
-		account->setAccountDataValidUntil(validUntil);
-
-		// Set default TTL if none provided
-		if (account->getAccountDataValidUntil()->getTime() == 0) {
-			Time defaultTTL;
-			defaultTTL.addMiliTime(300000); // 5 minute default
-			account->setAccountDataValidUntil(defaultTTL);
-		}
+		// Mark fields ready for applyToManagedObject() on the Core3 task
+		// thread; do NOT touch the Account managed object here - we are on a
+		// cpprestsdk continuation thread and must not block the HTTP pool on
+		// a Locker.
+		parsedFullAccount = true;
 
 		return true;
 
@@ -957,6 +1128,34 @@ bool AccountResult::parse() {
 		return false;
 	} catch (const std::exception&) {
 		return false;
+	}
+}
+
+void AccountResult::applyToManagedObject() {
+	// Only run when parse() populated the full record and we have an Account
+	// to write to (accountIDOnly mode and parse failures both skip apply).
+	if (!parsedFullAccount || account == nullptr) {
+		return;
+	}
+
+	Locker locker(account);
+
+	account->setAccountID(accountID);
+	account->setStationID(stationID);
+	account->setUsername(username);
+	account->setActive(active);
+	account->setAdminLevel(adminLevel);
+	account->setTimeCreated(created);
+	account->setBanExpires(banExpires);
+	account->setBanReason(banReason);
+	account->setBanAdmin(banAdmin);
+	account->setAccountDataValidUntil(validUntil);
+
+	// Set default TTL if none provided
+	if (account->getAccountDataValidUntil()->getTime() == 0) {
+		Time defaultTTL;
+		defaultTTL.addMiliTime(300000); // 5 minute default
+		account->setAccountDataValidUntil(defaultTTL);
 	}
 }
 
@@ -985,9 +1184,9 @@ bool SWGRealmsAPI::apiCallBlocking(Reference<SWGRealmsAPIResult*> result, const 
 	// Reset blocking state
 	result->blockingReceived = false;
 
-	// Use signal queue for completion callback - it doesn't block during saves
-	// This prevents timeout when a blocking call is waiting during a save
-	result->useSignalQueue = true;
+	// Caller cv-parks below; broadcast must run mid-save, apply runs on caller thread.
+	result->blockDuringSaveEvent = false;
+	result->isBlockingCall = true;
 
 	// Set callback that signals completion
 	result->callback = [result]() {
@@ -1000,19 +1199,22 @@ bool SWGRealmsAPI::apiCallBlocking(Reference<SWGRealmsAPIResult*> result, const 
 	apiCall(result, "apiCallBlocking", path, method, body);
 
 	// Wait for result with timeout using result's members
-	Locker lock(&result->blockingMutex);
-	if (!result->blockingReceived) {
-		Time timeout;
-		timeout.addMiliTime(apiTimeoutMs);
+	bool timedOut = false;
+	{
+		Locker lock(&result->blockingMutex);
 
-		if (result->blockingCondition.timedWait(&result->blockingMutex, &timeout) != 0) {
-			warning() << result->getClientTrxId() << " TIMEOUT after " << apiTimeoutMs << "ms waiting for callback [path=" << path << "]";
-			errorMessage = "Timeout waiting for API response";
-			return false;
+		if (!result->blockingReceived) {
+			Time timeout;
+			timeout.addMiliTime(apiTimeoutMs);
+
+			if (result->blockingCondition.timedWait(&result->blockingMutex, &timeout) != 0) {
+				warning() << result->getClientTrxId() << " TIMEOUT after " << apiTimeoutMs << "ms waiting for callback [path=" << path << "]";
+				timedOut = true;
+			}
 		}
 	}
 
-	// Update statistics before return
+	// Update statistics on every return path (including timeout).
 	outstandingBlockingCalls.decrement();
 
 	uint64 elapsed = startTime.miliDifference();
@@ -1042,9 +1244,47 @@ bool SWGRealmsAPI::apiCallBlocking(Reference<SWGRealmsAPIResult*> result, const 
 		latency_500plus.increment();
 	}
 
+	if (timedOut) {
+		StringBuffer msg;
+		msg << "Timeout waiting for API response [path=" << path
+			<< " elapsed_ms=" << elapsed
+			<< " timeout_ms=" << apiTimeoutMs << "]";
+		errorMessage = msg.toString();
+		return false;
+	}
+
+	// Apply on caller thread so any upstream Locker(account) is same-thread recursive.
+	if (result->isActionAllowed()) {
+		try {
+			result->applyToManagedObject();
+		} catch (const std::exception& e) {
+			error() << result->getClientTrxId() << " applyToManagedObject exception: " << e.what();
+		}
+	}
+
 	// Check result status
 	if (!result->isActionAllowed()) {
-		errorMessage = result->getMessage(true);
+		StringBuffer msg;
+		msg << "[action=" << result->actionToString(result->getAction());
+
+		const String& httpStatus = result->getDebugValue("http_status");
+		if (!httpStatus.isEmpty()) {
+			msg << " http_status=" << httpStatus;
+		}
+
+		const String& trxId = result->getDebugValue("trx_id");
+		if (!trxId.isEmpty()) {
+			msg << " trx_id=" << trxId;
+		}
+
+		msg << " elapsed_ms=" << elapsed << "] " << result->getMessage(false);
+
+		const String& details = result->getDetails();
+		if (!details.isEmpty()) {
+			msg << " (" << details << ")";
+		}
+
+		errorMessage = msg.toString();
 		return false;
 	}
 
@@ -1171,8 +1411,12 @@ bool SWGRealmsAPI::getAccountDataBlocking(uint32 accountID, Reference<Account*> 
 }
 
 uint32 SWGRealmsAPI::getAccountID(const String& username, String& errorMessage) {
+	// Percent-encode the username so legacy account names with spaces or other
+	// reserved characters produce a valid path segment.
+	String encodedUsername(web::uri::encode_data_string(username.toCharArray()).c_str());
+
 	StringBuffer pathBuffer;
-	pathBuffer << "/v1/core3/galaxy/" << galaxyID << "/account/" << username;
+	pathBuffer << "/v1/core3/galaxy/" << galaxyID << "/account/" << encodedUsername;
 
 	Reference<AccountResult*> result = new AccountResult();  // accountID-only mode
 	if (!apiCallBlocking(result.castTo<SWGRealmsAPIResult*>(), pathBuffer.toString(), "GET", "", errorMessage)) {
@@ -2197,34 +2441,6 @@ public:
 	}
 };
 
-const TaskQueue* SWGRealmsAPI::getCustomQueue() {
-	static auto customQueue = []() {
-		auto numThreads = ConfigManager::instance()->getInt("Core3.Login.API.WorkerThreads", 4);
-		// This queue blocks during saves - safe for callbacks that modify managed objects
-		return Core::getTaskManager()->initializeCustomQueue("SWGRealmsAPI", numThreads);
-	}();
-
-	return customQueue;
-}
-
-const TaskQueue* SWGRealmsAPI::getSignalQueue() {
-	static auto signalQueue = []() {
-		// Non-blocking queue for blocking call completion signals only
-		// These callbacks just broadcast() to wake up the waiting thread
-		return Core::getTaskManager()->initializeCustomQueue("SWGRealmsSignal", 1, false);
-	}();
-
-	return signalQueue;
-}
-
-const TaskQueue* SWGRealmsAPI::getCustomMetricsQueue() {
-	static auto customQueue = []() {
-		return Core::getTaskManager()->initializeCustomQueue("SWGRealmsMetrics", 1);
-	}();
-
-	return customQueue;
-}
-
 void SWGRealmsAPI::scheduleMetricsPublish() {
 	int intervalSec = ConfigManager::instance()->getInt("Core3.Login.API.MetricsInterval", 600);
 
@@ -2245,7 +2461,7 @@ void SWGRealmsAPI::scheduleMetricsPublish() {
 	}
 
 	Reference<SWGRealmsMetricsTask*> task = new SWGRealmsMetricsTask(intervalSec);
-	task->setCustomTaskQueue(getCustomMetricsQueue()->getName());
+	task->setCustomTaskQueue(metricsQueue->getName());
 	task->schedule(intervalSec * 1000);
 
 	info(true) << "Scheduled metrics publishing every " << intervalSec << " seconds";
